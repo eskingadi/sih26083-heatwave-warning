@@ -1,0 +1,986 @@
+"""FastAPI Application for SIH26083 Extreme Heatwave Early Warning System.
+
+Exposes production-ready REST endpoints for:
+- /api/weather/{ward_id} : Weather observations and forecasts per ward
+- /api/risk/{ward_id}    : Synthesized risk scores and advisories per ward
+- /api/wards/geojson     : GeoJSON ward boundaries with real-time risk choropleth properties
+- /api/forecast/{ward_id}: Multi-day predicted heatwave risk timeline
+- /api/alert/trigger     : Automated early warning dispatch via SMS / WhatsApp / Webhook
+- /health                : Service and database health check
+"""
+
+import json
+import uuid
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
+import pandas as pd
+
+from backend.config import settings
+from backend.db.session import get_db, init_db
+from backend.db.models_orm import (
+    WardBoundary,
+    WardVulnerability,
+    WeatherReading,
+    RiskForecast,
+    AlertLog,
+)
+from backend.models import (
+    AlertRequest,
+    AlertResponse,
+    AlertChannel,
+    RiskLevel,
+    WardRiskScore,
+    PopulationImpactResponse,
+    CopilotChatRequest,
+    CopilotChatResponse,
+)
+from backend.alerts.alert_engine import send_ward_alert
+from backend.vulnerability_model.health_consequence_map import (
+    build_population_impact_breakdown,
+    get_population_impact as compute_population_impact,
+)
+from backend.copilot import process_copilot_chat
+from backend.personal_risk import (
+    PersonalRiskRequest,
+    PersonalRiskResponse,
+    calculate_personal_risk,
+)
+from backend.profession_modes import (
+    PROFESSION_MODES_CONFIG,
+    ProfessionModeDetail,
+    ProfessionModeResponse,
+    get_hourly_risk_forecast,
+)
+from backend.subscriptions import (
+    SubscribeRequest,
+    SubscribeResponse,
+    UnsubscribeRequest,
+    UnsubscribeResponse,
+    InboundWebhookResponse,
+    subscribe as subscribe_citizen,
+    unsubscribe as unsubscribe_citizen,
+    handle_stop_reply,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Ensure database schema is initialized and auto-seeded on application startup."""
+    try:
+        init_db()
+        from backend.db.session import SessionLocal
+        from backend.db.seed import seed_all
+        db = SessionLocal()
+        try:
+            if db.query(WardBoundary).count() == 0:
+                logger.info("Database is empty on cold start. Auto-seeding pilot city data...")
+                seed_all(db)
+                logger.info("Auto-seeding complete.")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("Could not auto-initialize DB on startup: %s", e)
+    yield
+
+
+app = FastAPI(
+    title="SIH26083: Heatwave Early Warning & Thermal Stress API",
+    description=(
+        "Production backend microservices delivering high-resolution municipal ward-level "
+        "human thermal stress calculations, socio-demographic vulnerability indices, "
+        "multi-day predictive risk forecasts, and automated early warning alert logging."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Enable CORS for Leaflet.js frontend dashboard and civic portals
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _compute_risk_level(composite_score: float) -> RiskLevel:
+    """Determine categorical risk rating from 0.0 - 1.0 composite score."""
+    if composite_score < 0.25:
+        return RiskLevel.LOW
+    elif composite_score < 0.50:
+        return RiskLevel.MODERATE
+    elif composite_score < 0.70:
+        return RiskLevel.HIGH
+    elif composite_score < 0.85:
+        return RiskLevel.VERY_HIGH
+    else:
+        return RiskLevel.EXTREME
+
+
+def _get_advisory_text(risk_level: RiskLevel, ward_name: str) -> str:
+    """Generate actionable municipal and public advisories tailored to risk severity."""
+    advisories = {
+        RiskLevel.EXTREME: (
+            f"CRITICAL HEAT EMERGENCY for {ward_name}: Cease all outdoor physical labor immediately. "
+            "Municipal authorities must activate maximum cooling shelters, mobilize mobile hydration tankers, "
+            "and place emergency hospital heatstroke units on Code Red alert."
+        ),
+        RiskLevel.VERY_HIGH: (
+            f"SEVERE HEAT ALERT for {ward_name}: Mandatory cessation of strenuous outdoor physical work "
+            "between 11:00 AM and 4:30 PM. Distribute oral rehydration salts (ORS) across informal settlements "
+            "and high-density transit corridors."
+        ),
+        RiskLevel.HIGH: (
+            f"HIGH HEAT ADVISORY for {ward_name}: Restrict outdoor manual labor between 12:00 PM and 4:00 PM. "
+            "Activate municipal drinking water kiosks, ensure shaded resting zones, and alert vulnerable elderly residents."
+        ),
+        RiskLevel.MODERATE: (
+            f"MODERATE HEAT CAUTION for {ward_name}: Recommend frequent hydration and periodic shaded rest "
+            "for outdoor workers and school children. Monitor vulnerable demographics."
+        ),
+        RiskLevel.LOW: (
+            f"NORMAL CONDITIONS for {ward_name}: Normal civic and economic operations. "
+            "Maintain baseline municipal heat action plan monitoring."
+        ),
+    }
+    return advisories.get(risk_level, advisories[RiskLevel.MODERATE])
+
+
+def _get_risk_color(risk_level: RiskLevel) -> str:
+    """Hex color code for choropleth rendering."""
+    colors = {
+        RiskLevel.LOW: "#2ecc71",        # Green
+        RiskLevel.MODERATE: "#f1c40f",   # Yellow
+        RiskLevel.HIGH: "#e67e22",       # Orange
+        RiskLevel.VERY_HIGH: "#e74c3c",  # Red
+        RiskLevel.EXTREME: "#8e44ad",    # Purple
+    }
+    return colors.get(risk_level, "#3498db")
+
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    """Root metadata and API discovery endpoint."""
+    return {
+        "project": "SIH26083: Extreme Heatwave Early Warning & Human Thermal Stress Index",
+        "version": "1.0.0",
+        "status": "operational",
+        "target_city": settings.default_city,
+        "endpoints": [
+            "/api/wards/geojson",
+            "/api/india/geojson",
+            "/api/risk/{ward_id}",
+            "/api/population-impact/{ward_id}",
+            "/api/weather/{ward_id}",
+            "/api/forecast/{ward_id}",
+            "/api/alert/trigger",
+            "/api/backtest/summary",
+            "/api/backtest/timeline",
+            "/api/backtest/geojson",
+            "/health",
+            "/docs",
+        ],
+    }
+
+
+@app.get("/health")
+def health(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Service health check and database connectivity validation."""
+    db_status = "connected"
+    wards_count = 0
+    try:
+        wards_count = db.query(WardBoundary).count()
+    except Exception as e:
+        db_status = f"unhealthy: {str(e)}"
+
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": db_status,
+        "wards_count": wards_count,
+    }
+
+
+@app.get("/api/wards/geojson")
+def get_wards_geojson(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Retrieve GeoJSON FeatureCollection of municipal ward boundaries with live risk properties.
+
+    Optimized for Leaflet.js choropleth rendering, popup tooltips, and interactive filtering.
+    """
+    wards = db.query(WardBoundary).all()
+    if not wards:
+        logger.info("WardBoundary table is empty. Running automatic seed fallback...")
+        try:
+            from backend.db.seed import seed_all
+            seed_all(db)
+            wards = db.query(WardBoundary).all()
+        except Exception as seed_err:
+            logger.error("Auto-seed fallback failed: %s", seed_err)
+
+    if not wards:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No ward boundaries found in database. Please run db seed pipeline.",
+        )
+
+    features = []
+    for ward in wards:
+        vuln = ward.vulnerability
+        # Latest weather reading for this ward
+        latest_weather = (
+            db.query(WeatherReading)
+            .filter(WeatherReading.ward_id == ward.ward_id)
+            .order_by(desc(WeatherReading.timestamp))
+            .first()
+        )
+
+        hazard_score = (latest_weather.thermal_stress_score / 100.0) if latest_weather else 0.65
+        vuln_score = vuln.vulnerability_score if vuln else 0.50
+        final_risk = round(0.60 * hazard_score + 0.40 * vuln_score, 4)
+        risk_tier = _compute_risk_level(final_risk)
+
+        try:
+            geometry_dict = json.loads(ward.geometry_geojson)
+        except Exception:
+            geometry_dict = {"type": "Polygon", "coordinates": []}
+
+        properties = {
+            "ward_id": ward.ward_id,
+            "ward_name": ward.ward_name,
+            "city": ward.city,
+            "zone": ward.zone or "Unassigned",
+            "area_sqkm": ward.area_sqkm,
+            "center_lat": ward.center_lat,
+            "center_lon": ward.center_lon,
+            # Vulnerability
+            "vulnerability_score": vuln_score,
+            "vulnerability_tier": vuln.risk_tier if vuln else "Medium",
+            "elderly_pct": vuln.elderly_pct if vuln else None,
+            "outdoor_worker_pct": vuln.outdoor_worker_pct if vuln else None,
+            "slum_pct": vuln.slum_pct if vuln else None,
+            "green_cover_pct": vuln.green_cover_pct if vuln else None,
+            "hospital_bed_density": vuln.hospital_bed_density if vuln else None,
+            # Absolute Population Impact Metrics
+            "total_population": vuln.total_population if vuln and vuln.total_population else 100000,
+            "count_age_0_5": vuln.count_age_0_5 if vuln and vuln.count_age_0_5 else int(round((vuln.total_population or 100000) * 0.092)),
+            "count_age_60_plus": vuln.count_age_60_plus if vuln and vuln.count_age_60_plus else int(round((vuln.total_population or 100000) * ((vuln.elderly_pct if vuln else 10.0) / 100.0))),
+            "count_outdoor_labor": vuln.count_outdoor_labor if vuln and vuln.count_outdoor_labor else int(round((vuln.total_population or 100000) * ((vuln.outdoor_worker_pct if vuln else 35.0) / 100.0))),
+            "count_slum_residents": vuln.count_slum_residents if vuln and vuln.count_slum_residents else int(round((vuln.total_population or 100000) * ((vuln.slum_pct if vuln else 20.0) / 100.0))),
+            # Thermal / Weather
+            "temp_c": latest_weather.temp_c if latest_weather else None,
+            "humidity_pct": latest_weather.humidity_pct if latest_weather else None,
+            "heat_index_c": latest_weather.heat_index_c if latest_weather else None,
+            "wbgt_c": latest_weather.wbgt_c if latest_weather else None,
+            "utci_c": latest_weather.utci_c if latest_weather else None,
+            "thermal_stress_score": latest_weather.thermal_stress_score if latest_weather else None,
+            # Synthesized Risk
+            "thermal_hazard_score": round(hazard_score, 4),
+            "final_risk_score": final_risk,
+            "risk_level": risk_tier.value,
+            "color": _get_risk_color(risk_tier),
+            "advisory": _get_advisory_text(risk_tier, ward.ward_name),
+        }
+
+        features.append({
+            "type": "Feature",
+            "id": ward.ward_id,
+            "geometry": geometry_dict,
+            "properties": properties,
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "city": settings.default_city,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total_wards": len(features),
+        "features": features,
+    }
+
+
+_INDIA_GEOJSON_CACHE: Optional[Dict[str, Any]] = None
+
+
+@app.get("/api/india/geojson")
+def get_india_geojson() -> Dict[str, Any]:
+    """Retrieve GeoJSON FeatureCollection of all Indian States and Union Territories.
+
+    Contains regional biometeorological hazard metrics, WBGT, Heat Index, and HVI demographic vulnerability.
+    """
+    global _INDIA_GEOJSON_CACHE
+    if _INDIA_GEOJSON_CACHE is not None:
+        return _INDIA_GEOJSON_CACHE
+
+    from backend.config import RAW_DATA_DIR, BASE_DIR
+    india_geojson_path = RAW_DATA_DIR / "india_states.geojson"
+    if not india_geojson_path.exists():
+        india_geojson_path = BASE_DIR / "data" / "raw" / "india_states.geojson"
+
+    if not india_geojson_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="India regional GeoJSON dataset not found. Please verify data/raw/india_states.geojson.",
+        )
+
+    with open(india_geojson_path, "r", encoding="utf-8") as f:
+        _INDIA_GEOJSON_CACHE = json.load(f)
+
+    return _INDIA_GEOJSON_CACHE
+
+
+@app.get("/api/risk/{ward_id}", response_model=WardRiskScore)
+def get_ward_risk(ward_id: str, db: Session = Depends(get_db)) -> WardRiskScore:
+    """Retrieve composite heatwave risk score and civic advisory for a specific ward."""
+    ward = db.query(WardBoundary).filter(WardBoundary.ward_id == ward_id).first()
+    if not ward:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ward '{ward_id}' not found in database.",
+        )
+
+    vuln = ward.vulnerability
+    latest_weather = (
+        db.query(WeatherReading)
+        .filter(WeatherReading.ward_id == ward.ward_id)
+        .order_by(desc(WeatherReading.timestamp))
+        .first()
+    )
+
+    hazard_score = (latest_weather.thermal_stress_score / 100.0) if latest_weather else 0.65
+    vuln_score = vuln.vulnerability_score if vuln else 0.50
+    final_risk = round(0.60 * hazard_score + 0.40 * vuln_score, 4)
+    risk_tier = _compute_risk_level(final_risk)
+
+    forecast_records = (
+        db.query(RiskForecast)
+        .filter(RiskForecast.ward_id == ward.ward_id)
+        .order_by(RiskForecast.forecast_horizon_days.asc())
+        .all()
+    )
+    forecast_list = [
+        {
+            "horizon_days": fc.forecast_horizon_days,
+            "forecast_date": fc.forecast_date.isoformat(),
+            "predicted_risk_score": fc.predicted_risk_score,
+            "predicted_risk_tier": fc.predicted_risk_tier,
+        }
+        for fc in forecast_records
+    ]
+
+    return WardRiskScore(
+        ward_id=ward.ward_id,
+        ward_name=ward.ward_name,
+        city=ward.city,
+        timestamp=latest_weather.timestamp if latest_weather else datetime.now(timezone.utc),
+        thermal_hazard_score=round(hazard_score, 4),
+        vulnerability_score=round(vuln_score, 4),
+        final_risk_score=final_risk,
+        risk_level=risk_tier,
+        recommended_action=_get_advisory_text(risk_tier, ward.ward_name),
+        forecasts=forecast_list,
+    )
+
+
+@app.get("/api/population-impact/{ward_id}", response_model=PopulationImpactResponse)
+def get_population_impact(ward_id: str, db: Session = Depends(get_db)) -> PopulationImpactResponse:
+    """Retrieve population-segmented health consequence impact for a specific ward.
+
+    Differentiates generic weather alerts by showing WHO specifically is affected
+    and HOW, with real estimated population counts based on WHO & Ahmedabad HAP findings.
+    """
+    ward = db.query(WardBoundary).filter(WardBoundary.ward_id == ward_id).first()
+    if not ward:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ward '{ward_id}' not found in database.",
+        )
+
+    vuln = ward.vulnerability
+    latest_weather = (
+        db.query(WeatherReading)
+        .filter(WeatherReading.ward_id == ward.ward_id)
+        .order_by(desc(WeatherReading.timestamp))
+        .first()
+    )
+
+    hazard_score = (latest_weather.thermal_stress_score / 100.0) if latest_weather else 0.65
+    vuln_score = vuln.vulnerability_score if vuln else 0.50
+    final_risk = round(0.60 * hazard_score + 0.40 * vuln_score, 4)
+    risk_tier = _compute_risk_level(final_risk)
+
+    total_pop = int(vuln.total_population) if vuln and vuln.total_population else 100000
+    elderly_pct = float(vuln.elderly_pct) if vuln else 10.0
+    outdoor_pct = float(vuln.outdoor_worker_pct) if vuln else 35.0
+    slum_pct = float(vuln.slum_pct) if vuln else 20.0
+    green_pct = float(vuln.green_cover_pct) if vuln else 15.0
+
+    breakdown = compute_population_impact(
+        ward_data={
+            "ward_id": ward.ward_id,
+            "ward_name": ward.ward_name,
+            "total_population": total_pop,
+            "elderly_pct": elderly_pct,
+            "outdoor_worker_pct": outdoor_pct,
+            "slum_pct": slum_pct,
+            "green_cover_pct": green_pct,
+            "data_source_url": getattr(vuln, "data_source_url", None),
+            "data_pulled_at": getattr(vuln, "data_pulled_at", None),
+        },
+        risk_tier=risk_tier,
+        final_risk_score=final_risk,
+    )
+
+    return PopulationImpactResponse(**breakdown)
+
+
+@app.get("/api/weather/{ward_id}")
+def get_ward_weather(ward_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Retrieve meteorological observations, thermal indices, and history for a specific ward."""
+    ward = db.query(WardBoundary).filter(WardBoundary.ward_id == ward_id).first()
+    if not ward:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ward '{ward_id}' not found in database.",
+        )
+
+    readings = (
+        db.query(WeatherReading)
+        .filter(WeatherReading.ward_id == ward.ward_id)
+        .order_by(desc(WeatherReading.timestamp))
+        .limit(24)
+        .all()
+    )
+
+    if not readings:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No weather observations recorded for ward '{ward_id}'.",
+        )
+
+    latest = readings[0]
+    history = [
+        {
+            "timestamp": r.timestamp.isoformat(),
+            "temp_c": r.temp_c,
+            "humidity_pct": r.humidity_pct,
+            "wind_speed_ms": r.wind_speed_ms,
+            "solar_radiation_wm2": r.solar_radiation_wm2,
+            "heat_index_c": r.heat_index_c,
+            "wbgt_c": r.wbgt_c,
+            "utci_c": r.utci_c,
+            "thermal_stress_score": r.thermal_stress_score,
+            "source": r.source,
+        }
+        for r in readings
+    ]
+
+    return {
+        "ward_id": ward.ward_id,
+        "ward_name": ward.ward_name,
+        "city": ward.city,
+        "center_lat": ward.center_lat,
+        "center_lon": ward.center_lon,
+        "latest": history[0],
+        "history_count": len(history),
+        "history": history,
+    }
+
+
+@app.get("/api/forecast/{ward_id}")
+def get_ward_forecast(ward_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Retrieve 5-day predictive heatwave risk projections for a specific ward."""
+    ward = db.query(WardBoundary).filter(WardBoundary.ward_id == ward_id).first()
+    if not ward:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Ward '{ward_id}' not found in database.",
+        )
+
+    forecasts = (
+        db.query(RiskForecast)
+        .filter(RiskForecast.ward_id == ward.ward_id)
+        .order_by(RiskForecast.forecast_horizon_days.asc())
+        .all()
+    )
+
+    return {
+        "ward_id": ward.ward_id,
+        "ward_name": ward.ward_name,
+        "city": ward.city,
+        "forecasts": [
+            {
+                "horizon_days": f.forecast_horizon_days,
+                "forecast_date": f.forecast_date.isoformat(),
+                "predicted_risk_score": f.predicted_risk_score,
+                "predicted_risk_tier": f.predicted_risk_tier,
+                "generated_at": f.generated_at.isoformat(),
+            }
+            for f in forecasts
+        ],
+    }
+
+
+@app.post("/api/alert/trigger", response_model=AlertResponse)
+def trigger_alert(payload: AlertRequest, db: Session = Depends(get_db)) -> AlertResponse:
+    """Trigger and log an early warning alert dispatch via SMS, WhatsApp, or Webhook."""
+    ward = db.query(WardBoundary).filter(WardBoundary.ward_id == payload.ward_id).first()
+    if not ward:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Cannot dispatch alert: Ward '{payload.ward_id}' does not exist.",
+        )
+
+    return send_ward_alert(
+        ward_id=payload.ward_id,
+        recipient_phone=payload.recipient_phone,
+        channel=payload.channel,
+        force=payload.force,
+        db=db,
+    )
+
+
+# ==============================================================================
+# Historical Backtesting & Validation Endpoints (Day 8 / Day 9 Live Demo)
+# ==============================================================================
+
+_backtest_cache: Optional[Dict[str, Any]] = None
+
+
+def _get_backtest_data() -> Dict[str, Any]:
+    """Retrieve and cache historical backtest analysis results in memory."""
+    global _backtest_cache
+    if _backtest_cache is None:
+        from backend.backtesting.validation_report import run_backtest_pipeline
+        _backtest_cache = run_backtest_pipeline()
+    return _backtest_cache
+
+
+@app.get("/api/backtest/summary")
+def get_backtest_summary() -> Dict[str, Any]:
+    """Retrieve historical heatwave backtest event metadata and validation findings."""
+    data = _get_backtest_data()
+    meta = data["event_metadata"]
+    peak = data["peak_summary"]
+
+    return {
+        "event_name": meta["event_name"],
+        "city": meta["city"],
+        "state": meta["state"],
+        "date_window": f"{meta['start_date']} to {meta['end_date']}",
+        "peak_date": data["peak_date"],
+        "peak_temp_c": peak["max_temp_c"],
+        "peak_heat_index_c": peak["max_heat_index_c"],
+        "peak_wbgt_c": peak["max_wbgt_c"],
+        "peak_thermal_hazard": peak["max_thermal_stress"],
+        "published_excess_mortality": meta["published_excess_mortality"],
+        "mortality_increase_pct": meta["mortality_increase_pct"],
+        "source_citation": meta["source_citation"],
+        "hap_reference": meta["hap_reference"],
+        "validation_status": "Empirically Validated against Azhar et al. (2014) PLOS ONE",
+    }
+
+
+@app.get("/api/backtest/timeline")
+def get_backtest_timeline() -> Dict[str, Any]:
+    """Retrieve day-by-day historical heatwave progression for timeline rendering."""
+    data = _get_backtest_data()
+    daily_records = data["daily_df"].to_dict(orient="records")
+    return {
+        "event": data["event_metadata"]["event_name"],
+        "total_days": len(daily_records),
+        "timeline": daily_records,
+    }
+
+
+@app.get("/api/backtest/geojson")
+def get_backtest_geojson(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """Retrieve GeoJSON FeatureCollection showing peak historical heatwave conditions (May 21, 2010).
+
+    Enables 'Backtest Mode' on the Leaflet dashboard, instantly transforming the map to show
+    how the system flagged the real historical catastrophe.
+    """
+    data = _get_backtest_data()
+    ward_risk_df = data["ward_risk_df"].set_index("ward_id")
+    peak = data["peak_summary"]
+
+    wards = db.query(WardBoundary).all()
+    if not wards:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No ward boundaries found in database.",
+        )
+
+    features = []
+    for ward in wards:
+        try:
+            geometry_dict = json.loads(ward.geometry_geojson)
+        except Exception:
+            geometry_dict = {"type": "Polygon", "coordinates": []}
+
+        # Look up historical risk for this ward
+        if ward.ward_id in ward_risk_df.index:
+            w_row = ward_risk_df.loc[ward.ward_id]
+            vuln_score = float(w_row["vulnerability_score"])
+            vuln_tier = str(w_row["vulnerability_tier"])
+            final_risk = float(w_row["final_risk_score"])
+            risk_tier = _compute_risk_level(final_risk)
+            elderly = float(w_row["elderly_pct"]) if pd.notna(w_row["elderly_pct"]) else 8.0
+            outdoor = float(w_row["outdoor_worker_pct"]) if pd.notna(w_row["outdoor_worker_pct"]) else 45.0
+            slum = float(w_row["slum_pct"]) if pd.notna(w_row["slum_pct"]) else 35.0
+            green = float(w_row["green_cover_pct"]) if pd.notna(w_row["green_cover_pct"]) else 12.0
+        else:
+            vuln_score = 0.50
+            vuln_tier = "Medium"
+            hazard = peak["max_thermal_stress"] / 100.0
+            final_risk = round(0.60 * hazard + 0.40 * vuln_score, 4)
+            risk_tier = _compute_risk_level(final_risk)
+            elderly, outdoor, slum, green = 8.0, 45.0, 35.0, 12.0
+
+        advisory = (
+            f"HISTORICAL BACKTEST (May 21, 2010) for {ward.ward_name}: Observed peak 45.4°C (46.8°C stn), "
+            f"Outdoor WBGT {peak['max_wbgt_c']}°C (mandatory work cessation breached). "
+            f"Catastrophic heat conditions matching published 43% excess mortality surge (Azhar et al. 2014)."
+        )
+
+        properties = {
+            "ward_id": ward.ward_id,
+            "ward_name": ward.ward_name,
+            "city": ward.city,
+            "zone": ward.zone or "Unassigned",
+            "area_sqkm": ward.area_sqkm,
+            "center_lat": ward.center_lat,
+            "center_lon": ward.center_lon,
+            "vulnerability_score": vuln_score,
+            "vulnerability_tier": vuln_tier,
+            "elderly_pct": elderly,
+            "outdoor_worker_pct": outdoor,
+            "slum_pct": slum,
+            "green_cover_pct": green,
+            "temp_c": peak["max_temp_c"],
+            "heat_index_c": peak["max_heat_index_c"],
+            "wbgt_c": peak["max_wbgt_c"],
+            "utci_c": peak["max_utci_c"],
+            "thermal_stress_score": peak["max_thermal_stress"],
+            "thermal_hazard_score": round(peak["max_thermal_stress"] / 100.0, 4),
+            "final_risk_score": final_risk,
+            "risk_level": risk_tier.value,
+            "color": _get_risk_color(risk_tier),
+            "advisory": advisory,
+            "is_historical_backtest": True,
+        }
+
+        features.append({
+            "type": "Feature",
+            "id": ward.ward_id,
+            "geometry": geometry_dict,
+            "properties": properties,
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "city": "Ahmedabad",
+        "timestamp": "2010-05-21T14:00:00Z",
+        "is_backtest_mode": True,
+        "event": "Ahmedabad May 2010 Heatwave Peak",
+        "total_wards": len(features),
+        "features": features,
+    }
+
+
+# ==============================================================================
+# Forecast Accuracy & Confusion Matrix Endpoint (Validation)
+# ==============================================================================
+
+_forecast_accuracy_cache: Optional[Dict[str, Any]] = None
+
+
+@app.get("/api/validation/forecast-accuracy")
+def get_forecast_accuracy_report() -> Dict[str, Any]:
+    """Retrieve empirical 72-hour forecast accuracy, confusion matrix, and tier metrics."""
+    global _forecast_accuracy_cache
+    if _forecast_accuracy_cache is None:
+        from backend.validation.forecast_accuracy import run_full_accuracy_pipeline
+        eval_results, _ = run_full_accuracy_pipeline(save_chart=True, use_cache=True)
+        cm_dict = {
+            str(row_tier): {str(col_tier): int(val) for col_tier, val in cols.items()}
+            for row_tier, cols in eval_results["confusion_matrix"].to_dict(orient="index").items()
+        }
+        _forecast_accuracy_cache = {
+            "total_evaluations": eval_results["total_evaluations"],
+            "correct_classifications": eval_results["correct_classifications"],
+            "overall_accuracy_pct": eval_results["overall_accuracy_pct"],
+            "within_1_tier_pct": eval_results["within_1_tier_pct"],
+            "confusion_matrix": cm_dict,
+            "tier_metrics": eval_results["tier_metrics"],
+            "bias": eval_results["bias"],
+            "continuous_errors": eval_results["continuous_errors"],
+            "chart_url": "/assets/forecast_accuracy_matrix.png",
+        }
+    return _forecast_accuracy_cache
+
+
+# ==============================================================================
+# Heat Copilot Conversational AI Endpoint (Day 12)
+# ==============================================================================
+
+@app.post("/api/copilot/chat", response_model=CopilotChatResponse)
+def copilot_chat_endpoint(
+    payload: CopilotChatRequest,
+    db: Session = Depends(get_db),
+) -> CopilotChatResponse:
+    """Conversational Heat Copilot assistant for personal thermal risk and dashboard guidance."""
+    try:
+        return process_copilot_chat(payload, db=db)
+    except Exception as e:
+        logger.error("Copilot chat processing error: %s", e, exc_info=True)
+        return CopilotChatResponse(
+            response_text=(
+                "I apologize, but I encountered an error processing your query. "
+                "Please make sure your ward is selected on the map or ask: 'What does WBGT mean?'"
+            ),
+            intent="general_question",
+            requires_ward_selection=False,
+        )
+
+
+# ==============================================================================
+# Personal Heat Twin Risk Engine Endpoint (Feature Extension)
+# ==============================================================================
+
+@app.post("/api/personal-risk/calculate", response_model=PersonalRiskResponse)
+def personal_risk_calculate_endpoint(
+    payload: PersonalRiskRequest,
+    db: Session = Depends(get_db),
+) -> PersonalRiskResponse:
+    """Evaluate personalized real-time heat risk profile, factor breakdown, and clinical advice."""
+    try:
+        return calculate_personal_risk(payload, db=db)
+    except Exception as e:
+        logger.error("Personal risk calculation error: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to calculate personal heat risk: {str(e)}",
+        )
+
+
+# ==============================================================================
+# Profession Modes Endpoints (Curated Role-Specific Heat Intelligence)
+# ==============================================================================
+
+@app.get("/api/profession-modes", response_model=List[ProfessionModeDetail])
+def list_profession_modes_endpoint() -> List[ProfessionModeDetail]:
+    """Retrieve metadata and descriptors for all 6 supported profession modes."""
+    return [
+        ProfessionModeDetail(
+            mode_id=cfg["mode_id"],
+            display_name=cfg["display_name"],
+            icon=cfg["icon"],
+            subtitle=cfg["subtitle"],
+            description=cfg["description"],
+        )
+        for cfg in PROFESSION_MODES_CONFIG.values()
+    ]
+
+
+@app.get("/api/profession-mode/{mode_id}", response_model=ProfessionModeResponse)
+def get_profession_mode_risk_endpoint(
+    mode_id: str,
+    ward_id: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    location: Optional[str] = None,
+    hours_ahead: int = 5,
+    db: Session = Depends(get_db),
+) -> ProfessionModeResponse:
+    """Retrieve role-tailored real-time risk, forward hourly breakdown, and clinical advice."""
+    try:
+        target_ward = ward_id
+        target_lat = lat
+        target_lon = lon
+
+        # Support location string if passed (e.g. location="AMD_01" or location="23.038,72.552")
+        if location and not target_ward and target_lat is None:
+            if "," in location:
+                try:
+                    parts = location.split(",")
+                    target_lat = float(parts[0].strip())
+                    target_lon = float(parts[1].strip())
+                except ValueError:
+                    target_ward = location.strip()
+            else:
+                target_ward = location.strip()
+
+        return get_hourly_risk_forecast(
+            mode_id=mode_id,
+            ward_id=target_ward,
+            lat=target_lat,
+            lon=target_lon,
+            hours_ahead=hours_ahead,
+            db=db,
+        )
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve),
+        )
+    except Exception as e:
+        logger.error("Profession mode risk evaluation error: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to evaluate profession mode heat risk: {str(e)}",
+        )
+
+
+# ==============================================================================
+# Day 18: Anonymous Alert Subscription & Inbound Carrier Webhooks
+# ==============================================================================
+
+@app.post(
+    "/api/subscribe",
+    response_model=SubscribeResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Subscriptions"],
+)
+def api_subscribe(
+    payload: SubscribeRequest,
+    db: Session = Depends(get_db),
+) -> SubscribeResponse:
+    """Subscribe an anonymous citizen phone number to hyper-local heatwave alerts (double opt-in)."""
+    try:
+        return subscribe_citizen(
+            phone_number=payload.phone_number,
+            ward_id=payload.ward_id,
+            lat=payload.lat,
+            lon=payload.lon,
+            channel=payload.channel,
+            db=db,
+        )
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve),
+        )
+    except Exception as e:
+        logger.error("Subscription endpoint error: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Subscription failed: {str(e)}",
+        )
+
+
+@app.post(
+    "/api/unsubscribe",
+    response_model=UnsubscribeResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Subscriptions"],
+)
+def api_unsubscribe(
+    payload: UnsubscribeRequest,
+    db: Session = Depends(get_db),
+) -> UnsubscribeResponse:
+    """Unsubscribe an anonymous citizen phone number from heatwave alerts."""
+    try:
+        return unsubscribe_citizen(
+            phone_number=payload.phone_number,
+            ward_id=payload.ward_id or "ALL",
+            db=db,
+        )
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve),
+        )
+    except Exception as e:
+        logger.error("Unsubscribe endpoint error: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unsubscription failed: {str(e)}",
+        )
+
+
+@app.post(
+    "/api/webhook/inbound-message",
+    response_model=InboundWebhookResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Subscriptions"],
+)
+async def api_inbound_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> InboundWebhookResponse:
+    """Inbound webhook handler for carrier SMS/WhatsApp replies (Twilio / Gupshup)."""
+    try:
+        content_type = request.headers.get("content-type", "")
+        phone_number = None
+        message_body = None
+
+        raw_body = await request.body()
+        body_text = raw_body.decode("utf-8", errors="replace").strip()
+
+        # 1. Check if JSON payload (Gupshup / API test clients)
+        if "application/json" in content_type or (body_text.startswith("{") and body_text.endswith("}")):
+            try:
+                json_data = json.loads(body_text)
+                phone_number = (
+                    json_data.get("From")
+                    or json_data.get("sender")
+                    or json_data.get("phone_number")
+                    or json_data.get("phone")
+                )
+                message_body = (
+                    json_data.get("Body")
+                    or json_data.get("message")
+                    or json_data.get("text")
+                    or json_data.get("message_text")
+                )
+            except Exception:
+                pass
+
+        # 2. Form URL-encoded payload (Twilio standard webhook)
+        if not phone_number or message_body is None:
+            import urllib.parse
+            parsed_form = urllib.parse.parse_qs(body_text)
+            phone_number = (
+                parsed_form.get("From", [None])[0]
+                or parsed_form.get("sender", [None])[0]
+                or parsed_form.get("phone", [None])[0]
+            )
+            message_body = (
+                parsed_form.get("Body", [None])[0]
+                or parsed_form.get("message", [None])[0]
+                or parsed_form.get("text", [None])[0]
+            )
+
+        if not phone_number or message_body is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Inbound webhook payload missing sender phone ('From'/'sender') or message text ('Body'/'message').",
+            )
+
+        return handle_stop_reply(
+            phone_number=str(phone_number),
+            message_text=str(message_body),
+            db=db,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Inbound carrier webhook error: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process inbound carrier message: {str(e)}",
+        )
+
+
+
+
+
+

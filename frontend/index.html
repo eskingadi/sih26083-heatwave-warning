@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SIH26083: Extreme Heatwave Early Warning & Thermal Stress Dashboard</title>
+
+  <!-- Leaflet CSS & JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- Custom Styles -->
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+
+  <!-- App Header -->
+  <header>
+    <div class="header-left">
+      <div class="header-logo">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="5"></circle>
+          <line x1="12" y1="1" x2="12" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="23"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="1" y1="12" x2="3" y2="12"></line>
+          <line x1="21" y1="12" x2="23" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </svg>
+        <h1>SIH26083: Extreme Heatwave Early Warning & Thermal Stress</h1>
+      </div>
+      <div class="scope-switcher-wrapper">
+        <label for="scope-selector" class="scope-label">Scope:</label>
+        <select id="scope-selector" class="scope-dropdown" title="Toggle between City pilot and National All-India map">
+          <option value="ahmedabad" selected>🏙️ Ahmedabad (48 Wards)</option>
+          <option value="india">🇮🇳 All India (35 States & UTs)</option>
+        </select>
+      </div>
+      <span class="team-tag">Team ClimateResilience | PS: SIH26083</span>
+    </div>
+
+    <div class="header-right">
+      <div id="system-status-pill" class="status-pill status-checking">
+        <span class="status-dot"></span>
+        <span id="system-status-text">Checking System...</span>
+      </div>
+      <button id="btn-how-it-works" class="btn-info-modal" title="Scientific methodology & how it works">
+        ℹ️ How This Works
+      </button>
+      <div class="live-indicator">
+        <div class="pulse-dot"></div>
+        <span id="last-refresh-time">Connecting to API...</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Top Navigation Tab Bar -->
+  <div class="top-nav-bar">
+    <div class="top-nav-tabs">
+      <button class="nav-tab-btn active" id="tab-btn-map" data-tab="map-view">
+        <span class="tab-icon">🗺️</span>
+        <span class="tab-label">Ward Map View</span>
+      </button>
+      <button class="nav-tab-btn" id="tab-btn-twin" data-tab="heat-twin-view">
+        <span class="tab-icon">👤</span>
+        <span class="tab-label">Personal Heat Twin</span>
+      </button>
+      <button class="nav-tab-btn" id="tab-btn-professions" data-tab="professions-view">
+        <span class="tab-icon">💼</span>
+        <span class="tab-label">Profession Modes</span>
+        <span class="tab-badge">New</span>
+      </button>
+      <button class="nav-tab-btn" id="tab-btn-alerts" data-tab="alerts-view">
+        <span class="tab-icon">🔔</span>
+        <span class="tab-label">SMS / WhatsApp Alerts</span>
+        <span class="tab-badge" style="background: #f97316;">Live</span>
+      </button>
+      <button class="nav-tab-btn" id="tab-btn-backtest" data-tab="backtest">
+        <span class="tab-icon">🕒</span>
+        <span class="tab-label">Backtest Mode (May 2010)</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- City Emergency Heat Alert Banner -->
+  <div id="alert-banner"></div>
+
+  <!-- Main View Area -->
+  <div id="main-container">
+    <!-- Map Canvas & Layer Controls -->
+    <div id="map-wrapper">
+      <div id="map-loading" class="map-loading-overlay">
+        <div class="spinner"></div>
+        <span id="map-loading-text">Loading High-Resolution Ward Layer...</span>
+      </div>
+      <div class="map-controls-overlay">
+        <div class="layer-btn-group">
+          <button class="layer-btn active" data-mode="risk">Composite Risk</button>
+          <button class="layer-btn" data-mode="hazard">Thermal Hazard</button>
+          <button class="layer-btn" data-mode="vulnerability">Vulnerability (HVI)</button>
+        </div>
+        <div class="mode-divider"></div>
+        <button id="btn-toggle-backtest" class="backtest-toggle-btn" data-active="false">
+          <span class="backtest-icon">🕒</span>
+          <span class="backtest-label">Backtest Mode (May 2010)</span>
+        </button>
+      </div>
+      <div id="map"></div>
+    </div>
+
+    <!-- Ward Inspector Drawer -->
+    <div id="sidebar">
+      <div class="sidebar-header">
+        <h2>
+          <span id="sidebar-ward-name">Select a Ward / State</span>
+          <span id="sidebar-risk-badge" class="risk-badge">--</span>
+        </h2>
+      </div>
+
+      <!-- Interactive Multi-Scale Drill-Down Banner -->
+      <div id="sidebar-drilldown-box" class="sidebar-drilldown-box" style="display: none;">
+        <button id="btn-drilldown-ahmedabad" class="btn-drilldown" title="Drill down to street-level 48 municipal wards">
+          <span>🏙️ Drill Down to Ahmedabad (48 Wards)</span>
+          <span class="drilldown-arrow">&rarr;</span>
+        </button>
+      </div>
+
+      <div class="sidebar-content">
+        <!-- Biometeorological Metric Grid -->
+        <div class="metrics-grid">
+          <div class="metric-tile">
+            <div class="tile-label">Air Temperature</div>
+            <div class="tile-value" id="metric-temp">--</div>
+          </div>
+          <div class="metric-tile">
+            <div class="tile-label">NOAA Heat Index</div>
+            <div class="tile-value" id="metric-hi">--</div>
+          </div>
+          <div class="metric-tile">
+            <div class="tile-label">Outdoor WBGT</div>
+            <div class="tile-value" id="metric-wbgt">--</div>
+          </div>
+          <div class="metric-tile">
+            <div class="tile-label">UTCI Bioclimate</div>
+            <div class="tile-value" id="metric-utci">--</div>
+          </div>
+          <div class="metric-tile">
+            <div class="tile-label">Thermal Hazard (0-100)</div>
+            <div class="tile-value" id="metric-thermal">--</div>
+          </div>
+          <div class="metric-tile">
+            <div class="tile-label">HVI Vulnerability</div>
+            <div class="tile-value" id="metric-hvi">--</div>
+          </div>
+        </div>
+
+        <!-- Demographic Vulnerability Breakdown -->
+        <div class="vuln-panel">
+          <h3>Vulnerability Indicators (Census 2011/PLFS)</h3>
+          <div class="factor-bar">
+            <div class="factor-label"><span>Elderly Population (60+)</span><span id="pct-elderly">--</span></div>
+            <div class="bar-track"><div id="bar-elderly" class="bar-fill" style="width: 0%"></div></div>
+          </div>
+          <div class="factor-bar">
+            <div class="factor-label"><span>Informal Outdoor Labor</span><span id="pct-outdoor">--</span></div>
+            <div class="bar-track"><div id="bar-outdoor" class="bar-fill" style="width: 0%"></div></div>
+          </div>
+          <div class="factor-bar">
+            <div class="factor-label"><span>Informal / Slum Dwellings</span><span id="pct-slum">--</span></div>
+            <div class="bar-track"><div id="bar-slum" class="bar-fill" style="width: 0%"></div></div>
+          </div>
+          <div class="factor-bar">
+            <div class="factor-label"><span>Tree Canopy / Green Cover</span><span id="pct-green">--</span></div>
+            <div class="bar-track"><div id="bar-green" class="bar-fill" style="width: 0%"></div></div>
+          </div>
+        </div>
+
+        <!-- Human Impact Card ("Who is Affected") -->
+        <div class="impact-panel" id="population-impact-panel">
+          <div class="impact-panel-header">
+            <h3>👥 Who Is Affected</h3>
+            <span class="impact-total-badge" id="impact-total-pop">Pop: --</span>
+          </div>
+          <p class="impact-summary-note" id="impact-summary-text">
+            Select a ward to evaluate demographic cohorts exposed to active thermal stress.
+          </p>
+          <div class="cohort-cards-grid" id="cohort-cards-container">
+            <!-- Populated dynamically via HumanImpactCard in main.js -->
+          </div>
+          <!-- Dominant Risk Driver Line (Part D) -->
+          <div class="dominant-driver-box" id="dominant-risk-driver-box" style="display: none;">
+            <span class="driver-label">🚨 Dominant Risk Driver:</span>
+            <span class="driver-value" id="dominant-risk-driver-value">--</span>
+          </div>
+          <!-- Traceable Data Provenance Button (Part D) -->
+          <div class="impact-provenance-footer">
+            <button id="btn-view-data-sources" class="btn-data-sources" type="button" title="View official Census 2011 & PLFS data provenance">
+              🔗 View Data Sources & Methodology
+            </button>
+          </div>
+        </div>
+
+        <!-- 5-Day Predictive Risk Forecast Chart -->
+        <div class="chart-card">
+          <h3>5-Day Predictive Risk Trend</h3>
+          <div class="chart-wrapper">
+            <canvas id="sidebar-forecast-chart"></canvas>
+          </div>
+        </div>
+
+        <!-- Actionable Civic Advisory -->
+        <div class="advisory-card">
+          <h3>Emergency Civic Advisory</h3>
+          <p id="sidebar-advisory" class="advisory-text">Loading municipal heat advisory recommendations...</p>
+        </div>
+
+        <!-- Automated Alert Dispatch Trigger Button -->
+        <button id="btn-dispatch-alert" class="alert-action-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+            <line x1="12" y1="9" x2="12" y2="13"></line>
+            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+          </svg>
+          Dispatch Early Warning Alert
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Standalone Personal Heat Twin View -->
+  <div id="personal-heat-twin-view" class="heat-twin-container" style="display: none;">
+    <div class="heat-twin-layout">
+      <!-- Left Column: User Input Form -->
+      <div class="heat-twin-card heat-twin-form-card">
+        <div class="twin-card-header">
+          <div class="twin-header-title">
+            <span class="twin-icon">🧬</span>
+            <div>
+              <h2>Personal Heat Twin</h2>
+              <p class="twin-subtitle">Tell us about yourself to receive your personalized real-time heat hazard score, clinical risk breakdown, and prevention steps.</p>
+            </div>
+          </div>
+        </div>
+
+        <form id="heat-twin-form" novalidate>
+          <div class="form-section-title">1. Your Profile & Demographics</div>
+          <div class="form-grid-2">
+            <div class="form-group">
+              <label for="twin-age-group">Age Group <span class="req">*</span></label>
+              <select id="twin-age-group" class="twin-select" required>
+                <option value="18-30">Young Adult (Age 18–30)</option>
+                <option value="31-45">Adult (Age 31–45)</option>
+                <option value="46-59">Middle Age (Age 46–59)</option>
+                <option value="60+" selected>Senior Citizen (Age 60+) ⚠️</option>
+                <option value="0-17">Child / Youth (Age 0–17)</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="twin-occupation">Occupation / Work Environment <span class="req">*</span></label>
+              <select id="twin-occupation" class="twin-select" required>
+                <option value="outdoor_worker" selected>Outdoor / Informal Labor (Vendor, Construction)</option>
+                <option value="indoor_worker">Indoor / Office Worker (Formal Sector)</option>
+                <option value="student">Student / Academic</option>
+                <option value="elderly_nonworking">Elderly Non-Working / Homebound</option>
+                <option value="other">Other / Commuter</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-section-title">2. Activity & Outdoor Exposure</div>
+          <div class="form-grid-2">
+            <div class="form-group">
+              <label for="twin-activity">Current / Planned Activity <span class="req">*</span></label>
+              <select id="twin-activity" class="twin-select" required>
+                <option value="heavy_labor" selected>Heavy Physical Labor (Manual work, construction) — ~300+ W</option>
+                <option value="moderate_exercise">Moderate Exercise / Cycling / Sports — ~230 W</option>
+                <option value="walking">Walking / Outdoor Errands / Transit — ~165 W</option>
+                <option value="resting">Resting / Standing in Shade — ~100 W</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <div class="duration-label-row">
+                <label for="twin-duration-slider">Continuous Outdoor Duration <span class="req">*</span></label>
+                <span id="twin-duration-badge" class="duration-badge">90 minutes (1.5 hrs)</span>
+              </div>
+              <input type="range" id="twin-duration-slider" min="5" max="360" step="5" value="90" class="twin-slider" />
+              <div class="slider-marks">
+                <span>15m</span>
+                <span>1 hr</span>
+                <span>2 hrs</span>
+                <span>4 hrs</span>
+                <span>6 hrs</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-section-title">3. Exposure Location</div>
+          <div class="form-group">
+            <label for="twin-ward-select">Municipal Ward / Neighborhood</label>
+            <div class="location-input-group">
+              <select id="twin-ward-select" class="twin-select">
+                <option value="AMD_01">Navrangpura (AMD_01)</option>
+              </select>
+              <button type="button" id="btn-twin-gps" class="btn-twin-gps" title="Detect your current location via browser GPS">
+                <span class="gps-icon">📍</span> Use My GPS
+              </button>
+            </div>
+            <div id="twin-location-feedback" class="twin-feedback-text">Using selected ward live weather stream.</div>
+          </div>
+
+          <div id="twin-form-error" class="form-error-alert" style="display: none;"></div>
+
+          <button type="submit" id="btn-twin-submit" class="btn-twin-submit">
+            <span class="btn-icon">⚡</span>
+            <span>Check My Real-Time Heat Risk</span>
+          </button>
+        </form>
+      </div>
+
+      <!-- Right Column: Personal Heat Risk Results Card -->
+      <div class="heat-twin-card heat-twin-results-card" id="heat-twin-results">
+        <div class="results-placeholder" id="results-placeholder">
+          <div class="placeholder-icon">🛡️</div>
+          <h3>Your Heat Twin is Ready</h3>
+          <p>Fill out your profile on the left and click <strong>"Check My Real-Time Heat Risk"</strong> to compute your personalized risk score, factor breakdown, and clinical safety protocol.</p>
+        </div>
+
+        <div class="results-content" id="results-content" style="display: none;">
+          <!-- Top Result Header -->
+          <div class="result-header-row">
+            <div class="result-title-block">
+              <span class="result-location-tag" id="result-ward-tag">Navrangpura (AMD_01)</span>
+              <h3>Personal Heat Risk Assessment</h3>
+              <div class="result-profile-chips" id="result-profile-chips">
+                <!-- Profile chips populated dynamically -->
+              </div>
+            </div>
+            <div class="result-score-block">
+              <div class="score-circle" id="result-score-circle">
+                <span class="score-num" id="result-score-num">--</span>
+                <span class="score-den">/100</span>
+              </div>
+              <span class="result-tier-badge" id="result-tier-badge">--</span>
+            </div>
+          </div>
+
+          <!-- Meteorological Live Ribbon -->
+          <div class="weather-ribbon" id="result-weather-ribbon">
+            <div class="ribbon-item">
+              <span class="ribbon-label">Air Temp</span>
+              <span class="ribbon-val" id="result-temp">--°C</span>
+            </div>
+            <div class="ribbon-item">
+              <span class="ribbon-label">Humidity</span>
+              <span class="ribbon-val" id="result-humidity">--%</span>
+            </div>
+            <div class="ribbon-item">
+              <span class="ribbon-label">WBGT (Outdoor)</span>
+              <span class="ribbon-val" id="result-wbgt">--°C</span>
+            </div>
+            <div class="ribbon-item">
+              <span class="ribbon-label">Heat Index</span>
+              <span class="ribbon-val" id="result-hi">--°C</span>
+            </div>
+            <div class="ribbon-item">
+              <span class="ribbon-label">UTCI Bioclimate</span>
+              <span class="ribbon-val" id="result-utci">--°C</span>
+            </div>
+          </div>
+
+          <!-- Factor Point-Contribution Breakdown (Distinctive Visual Design) -->
+          <div class="factor-breakdown-section">
+            <h4>🔬 Multi-Factor Point Contribution Breakdown</h4>
+            <p class="breakdown-subtitle">Points dynamically weighted from biometeorological indices (ISO 7243 WBGT, NOAA Heat Index) and clinical vulnerability models:</p>
+            <div class="factor-list" id="result-factor-list">
+              <!-- Dynamically populated factor rows -->
+            </div>
+          </div>
+
+          <!-- Safer Diurnal Window Banner -->
+          <div class="better-time-banner" id="result-better-time-banner">
+            <span class="banner-icon">🌅</span>
+            <div class="banner-body">
+              <strong>Safer Diurnal Time Window:</strong>
+              <span id="result-better-time-text">--</span>
+            </div>
+          </div>
+
+          <!-- Epidemiological Consequence & Prevention Recommendations -->
+          <div class="clinical-guidance-card">
+            <div class="guidance-block consequence-block">
+              <div class="guidance-title">
+                <span>⚠️</span>
+                <strong>Clinical & Physiological Health Consequence:</strong>
+              </div>
+              <p id="result-consequence-text">--</p>
+            </div>
+            <div class="guidance-block action-block">
+              <div class="guidance-title">
+                <span>🛡️</span>
+                <strong>Immediate Preventive Medical Action:</strong>
+              </div>
+              <p id="result-action-text">--</p>
+            </div>
+          </div>
+
+          <!-- Results Footer Actions -->
+          <div class="result-actions-footer">
+            <button type="button" id="btn-print-twin" class="btn-result-action" title="Print or save screenshot for presentation">
+              📸 Print / Save Profile
+            </button>
+            <button type="button" id="btn-back-to-map" class="btn-result-action btn-return-map" title="Switch back to municipal ward choropleth view">
+              🗺️ Return to Ward Map
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Standalone Profession Modes View -->
+  <div id="profession-modes-view" class="profession-modes-container" style="display: none;">
+    <div class="profession-modes-layout">
+      <!-- Top Section: Mode Selector Bar (6 Cards/Buttons) -->
+      <div class="modes-selector-header">
+        <div class="selector-title-row">
+          <div>
+            <h2>💼 Select Your Profession Mode</h2>
+            <p class="selector-subtitle">Tailored hour-by-hour heat risk trajectories and clinical action protocols customized for your occupational exposure.</p>
+          </div>
+          <!-- Location selector for profession modes -->
+          <div class="modes-location-box">
+            <label for="modes-ward-select">Ward:</label>
+            <select id="modes-ward-select" class="modes-select">
+              <option value="AMD_01">Navrangpura (AMD_01)</option>
+            </select>
+            <button type="button" id="btn-modes-gps" class="btn-modes-gps" title="Auto-detect current GPS location">
+              📍 GPS
+            </button>
+          </div>
+        </div>
+
+        <div class="modes-grid-cards" id="modes-grid-cards">
+          <!-- 6 Cards: Student, Delivery Worker, Construction Worker, Elderly Care, Outdoor Exercise, Farmer -->
+          <button class="mode-card" data-mode="student">
+            <span class="mode-card-icon">🎓</span>
+            <div class="mode-card-text">
+              <span class="mode-card-title">Student</span>
+              <span class="mode-card-desc">Transit & Campus</span>
+            </div>
+          </button>
+
+          <button class="mode-card active" data-mode="delivery_worker">
+            <span class="mode-card-icon">🛵</span>
+            <div class="mode-card-text">
+              <span class="mode-card-title">Delivery Worker</span>
+              <span class="mode-card-desc">Continuous Roadway</span>
+            </div>
+          </button>
+
+          <button class="mode-card" data-mode="construction_worker">
+            <span class="mode-card-icon">🏗️</span>
+            <div class="mode-card-text">
+              <span class="mode-card-title">Construction Worker</span>
+              <span class="mode-card-desc">Heavy Manual Site</span>
+            </div>
+          </button>
+
+          <button class="mode-card" data-mode="elderly_care">
+            <span class="mode-card-icon">👵</span>
+            <div class="mode-card-text">
+              <span class="mode-card-title">Elderly Care</span>
+              <span class="mode-card-desc">Senior & Homebound</span>
+            </div>
+          </button>
+
+          <button class="mode-card" data-mode="outdoor_exercise">
+            <span class="mode-card-icon">🏃</span>
+            <div class="mode-card-text">
+              <span class="mode-card-title">Outdoor Exercise</span>
+              <span class="mode-card-desc">Athletics & Cardio</span>
+            </div>
+          </button>
+
+          <button class="mode-card" data-mode="farmer">
+            <span class="mode-card-icon">🌾</span>
+            <div class="mode-card-text">
+              <span class="mode-card-title">Farmer</span>
+              <span class="mode-card-desc">Agricultural Field</span>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <!-- Main Section: Selected Mode Detailed Card (Matching DELIVERY MODE reference design) -->
+      <div class="profession-detail-card" id="profession-detail-card">
+        <div class="detail-card-header">
+          <div class="detail-header-left">
+            <span class="detail-mode-icon" id="detail-mode-icon">🛵</span>
+            <div>
+              <h2 id="detail-mode-title">DELIVERY MODE</h2>
+              <span class="detail-subtitle" id="detail-mode-subtitle">Two-Wheeler & Gig Courier Exposure</span>
+            </div>
+          </div>
+          <div class="detail-current-risk-box">
+            <span class="current-risk-label">Current risk:</span>
+            <span class="current-risk-score-badge" id="detail-current-score">78</span>
+            <span class="risk-dot" id="detail-current-dot"></span>
+            <span class="current-risk-tier-badge" id="detail-current-tier">HIGH</span>
+          </div>
+        </div>
+
+        <!-- Next N Hours Timeline -->
+        <div class="hourly-forecast-section">
+          <div class="section-badge-header">
+            <h3>⏰ Next 5 Hours:</h3>
+            <span class="hourly-subnote">Diurnal WBGT & apparent heat projection</span>
+          </div>
+          <div class="hourly-timeline-grid" id="detail-hourly-timeline">
+            <!-- Populated dynamically with hour range, tier badge, color dot, temp, WBGT -->
+          </div>
+        </div>
+
+        <!-- Recommended Actions Section -->
+        <div class="recommended-actions-section">
+          <div class="section-badge-header">
+            <h3>🛡️ Recommended:</h3>
+            <span class="hourly-subnote">Role-specific prevention protocols</span>
+          </div>
+          <div class="recommended-actions-list" id="detail-recommendations-list">
+            <!-- Populated dynamically with arrow bullets -->
+          </div>
+        </div>
+
+        <!-- Mode Footer / Quick Compare -->
+        <div class="detail-card-footer">
+          <div class="footer-note">
+            <span>ℹ️ Risk calculated using ISO 8996 metabolic rate and localized outdoor WBGT.</span>
+          </div>
+          <div class="footer-actions">
+            <button type="button" id="btn-compare-contrast" class="btn-detail-action" title="Compare this role against Student / Farmer mode">
+              ⚡ Compare Student vs Farmer
+            </button>
+            <button type="button" id="btn-modes-return-map" class="btn-detail-action btn-return-map" title="Switch back to municipal ward map">
+              🗺️ Return to Ward Map
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SMS / WhatsApp Alert Subscriptions View (Standalone Navigation Tab) -->
+  <div id="alerts-view" class="alerts-view-container" style="display: none;">
+    <div class="alerts-view-layout">
+      <!-- Left Column: Subscription Form Card -->
+      <div class="alerts-panel-card alerts-form-card">
+        <div class="alerts-card-header">
+          <div class="alerts-header-title">
+            <span class="alerts-main-icon">🔔</span>
+            <div>
+              <h2>SMS &amp; WhatsApp Alert Subscriptions</h2>
+              <p class="alerts-subtitle">Instant, anonymous heatwave early warnings delivered straight to your mobile device. Zero account or login required.</p>
+            </div>
+          </div>
+          <button type="button" id="btn-open-manage-sub" class="btn-manage-sub-link">
+            🔕 Manage / Unsubscribe
+          </button>
+        </div>
+
+        <form id="alert-subscription-form" class="alerts-dedicated-form">
+          <div class="form-section-title">1. Mobile Number &amp; Contact</div>
+          <div class="sub-input-group phone-group">
+            <label for="sub-phone-input">Mobile Number <span class="req">*</span></label>
+            <div class="phone-input-wrapper">
+              <span class="country-prefix">+91</span>
+              <input type="tel" id="sub-phone-input" class="sub-input" placeholder="98765 43210" required />
+            </div>
+            <span class="sub-field-hint">Supports Indian domestic 10-digit numbers or international E.164 formats.</span>
+          </div>
+
+          <div class="form-section-title">2. Target Municipal Ward</div>
+          <div class="sub-input-group ward-group">
+            <label for="sub-ward-select">Your Ward / Area <span class="req">*</span></label>
+            <div class="location-input-wrapper">
+              <select id="sub-ward-select" class="sub-input sub-select">
+                <option value="AMD_01">Navrangpura (AMD_01)</option>
+              </select>
+              <button type="button" id="btn-sub-gps" class="btn-sub-gps" title="Auto-detect current GPS location">
+                📍 GPS
+              </button>
+            </div>
+            <span id="sub-gps-status" class="sub-gps-status"></span>
+          </div>
+
+          <div class="form-section-title">3. Delivery Channel</div>
+          <div class="sub-input-group channel-group">
+            <label>Notification Channel <span class="req">*</span></label>
+            <div class="channel-toggle-group">
+              <label class="channel-radio-label">
+                <input type="radio" name="sub-channel" value="sms" checked />
+                <span class="radio-pill">📱 SMS Notification</span>
+              </label>
+              <label class="channel-radio-label">
+                <input type="radio" name="sub-channel" value="whatsapp" />
+                <span class="radio-pill">💬 WhatsApp Message</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="alerts-consent-box">
+            <span class="sub-consent-text">
+              🔒 <strong>Double Opt-In Protected:</strong> By subscribing, you agree to receive life-safety heat advisories for your area. Reply <strong>STOP</strong> anytime to instantly cancel.
+            </span>
+          </div>
+
+          <div class="alerts-form-actions">
+            <button type="submit" id="btn-sub-submit" class="btn-alerts-submit">
+              <span>🔔 Subscribe for Heat Alerts</span>
+              <span class="btn-arrow">&rarr;</span>
+            </button>
+            <button type="button" id="btn-alerts-return-map" class="btn-detail-action btn-return-map" title="Switch back to municipal ward map">
+              🗺️ Return to Ward Map
+            </button>
+          </div>
+
+          <!-- Live Feedback Banner (Success / Error) -->
+          <div id="sub-feedback-banner" class="sub-feedback-banner" style="display: none;"></div>
+        </form>
+      </div>
+
+      <!-- Right Column: Interactive Notification Preview & Live Simulator -->
+      <div class="alerts-panel-card alerts-preview-card">
+        <div class="alerts-card-header">
+          <div class="alerts-header-title">
+            <span class="alerts-main-icon">📲</span>
+            <div>
+              <h2>Live Alert Preview &amp; Simulator</h2>
+              <p class="alerts-subtitle">Real-time preview of the emergency notification dispatched to your mobile.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="live-simulator-body">
+          <div class="device-mockup-frame">
+            <div class="device-screen">
+              <div class="device-app-header">
+                <span class="app-dot"></span>
+                <span id="simulator-app-name">💬 WhatsApp &bull; Heatwave Early Warning</span>
+                <span class="app-time">Just Now</span>
+              </div>
+              <div class="device-bubble-container">
+                <div class="device-chat-bubble" id="simulator-chat-bubble">
+                  <strong>🚨 SIH26083: EXTREME HEATWAVE EARLY WARNING</strong><br>
+                  ━━━━━━━━━━━━━━━━━━━━━━━━━━<br>
+                  🛡️ <strong>STATUS:</strong> ✅ SUBSCRIPTION CONFIRMED<br><br>
+                  📍 <strong>Jurisdiction:</strong> <span id="sim-ward-name">Vatva</span> [<span id="sim-ward-id">AMD_17</span>]<br>
+                  ⏱️ <strong>Monitoring:</strong> Active 24/7 Real-Time<br>
+                  🔔 <strong>Tracking SID:</strong> #WA-638003-AMD17<br><br>
+                  📋 <strong>MONITORING SCOPE:</strong><br>
+                  • Real-time WBGT &amp; Human Thermal Stress Index<br>
+                  • Automated Code Red / Orange Hazard Warnings<br>
+                  • Demographic &amp; Vulnerability Cohort Advisories<br><br>
+                  💧 <strong>Immediate Preparedness Actions:</strong><br>
+                  • Maintain ORS hydration and carry water outdoors<br>
+                  • Cease strenuous labor during peak hours (11:30 AM - 4:00 PM)<br>
+                  • Nearest AMC Shelter: Community Health Centre<br><br>
+                  <em>To unsubscribe at any time, reply STOP.</em><br>
+                  ━━━━━━━━━━━━━━━━━━━━━━━━━━<br>
+                  <em>🏛️ Ahmedabad Municipal Corporation &amp; NDMA</em>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="compliance-highlights-box">
+            <h4>🛡️ Telecom Safety &amp; Regulatory Highlights</h4>
+            <div class="compliance-tags-grid">
+              <span class="comp-tag">✅ Double Opt-In Standard</span>
+              <span class="comp-tag">✅ STOP Keyword Opt-Out</span>
+              <span class="comp-tag">✅ TRAI DLT Compliant</span>
+              <span class="comp-tag">✅ Rate Limited (Max 3/hr)</span>
+              <span class="comp-tag">✅ Spam Cap (Max 3/day)</span>
+              <span class="comp-tag">✅ Emergency 108 Helpline</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Educational Explainer Modal ("How This Works") -->
+  <div id="info-modal" class="modal-backdrop" style="display: none;">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h2>🌡️ How The SIH26083 Platform Works</h2>
+        <button id="btn-close-modal" class="modal-close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-lead">
+          Traditional heat warnings rely solely on dry-bulb air temperature. This platform fuses multi-source meteorological reanalysis with biometeorological human thermal stress and demographic vulnerability.
+        </p>
+
+        <div class="explainer-section">
+          <h3>1. Biometeorological Hazard Indices (60% Weight)</h3>
+          <ul>
+            <li>
+              <strong>Outdoor WBGT (ISO 7243)</strong>: Accounts for direct solar radiation, humidity, and wind cooling. When WBGT exceeds 32°C, human metabolic heat dissipation fails, necessitating mandatory cessation of physical labor.
+            </li>
+            <li>
+              <strong>NOAA Heat Index</strong>: Apparent temperature combining humidity and air temp using the Rothfusz regression equation.
+            </li>
+            <li>
+              <strong>Bröde UTCI</strong>: Universal Thermal Climate Index calculating physiological heat balance in outdoor environments.
+            </li>
+          </ul>
+        </div>
+
+        <div class="explainer-section">
+          <h3>2. Ward-Level Heat Vulnerability Index (HVI) (40% Weight)</h3>
+          <p>
+            Synthesized from Census 2011 and PLFS micro-data across 5 vulnerability vectors:
+          </p>
+          <ul>
+            <li><strong>Elderly Population (60+)</strong>: Physiological thermoregulatory fragility.</li>
+            <li><strong>Outdoor Workers</strong>: Daily-wage street vendors, construction, delivery personnel.</li>
+            <li><strong>Informal / Slum Dwellings</strong>: Metal/tin roofs exacerbating Urban Heat Island (UHI).</li>
+            <li><strong>Vegetation Canopy (NDVI)</strong>: Inverse cooling buffer from urban green cover.</li>
+            <li><strong>Hospital Bed Density</strong>: Access to emergency acute heatstroke care.</li>
+          </ul>
+        </div>
+
+        <div class="explainer-section">
+          <h3>3. Historical Empirical Validation (May 2010 Landmark Heatwave)</h3>
+          <p>
+            Validated against the catastrophic 2010 Ahmedabad heatwave (documented in <em>Azhar et al. 2014, PLOS ONE</em>). The system successfully triggered Code Red Extreme Hazard 48 hours in advance, accurately predicting the window of 1,344 excess deaths.
+          </p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-modal-got-it" class="btn-primary">Got It</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Traceable Data Sources & Methodology Modal (Part D) -->
+  <div id="sources-modal" class="modal-backdrop" style="display: none;">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h2>📊 Traceable Data Sources & Provenance</h2>
+        <button id="btn-close-sources-modal" class="modal-close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-lead">
+          Every number and advisory displayed in the <strong>Human Impact Card</strong> is grounded in verifiable public records. Nothing is fabricated.
+        </p>
+
+        <div class="explainer-section">
+          <h3>1. Official Census & Survey Provenance</h3>
+          <ul>
+            <li>
+              <strong>Primary Source</strong>: <a id="modal-source-url" href="https://censusindia.gov.in" target="_blank" rel="noopener noreferrer">https://censusindia.gov.in / MoSPI Periodic Labour Force Survey (PLFS)</a>
+            </li>
+            <li>
+              <strong>Extraction / Standardization Date</strong>: <span id="modal-pulled-date" class="highlight-date">2026-09-10</span>
+            </li>
+            <li>
+              <strong>Directly Measured Features</strong>: Municipal ward total resident population, senior citizens percentage (60+), informal labor percentage, and slum dwelling household percentage from the Ahmedabad Municipal Corporation (AMC) and Census 2011.
+            </li>
+          </ul>
+        </div>
+
+        <div class="explainer-section">
+          <h3>2. "Measured" vs "Derived" Cohort Accounting</h3>
+          <ul>
+            <li><strong>Total Ward Population</strong>: <span class="badge-measured">Measured</span> from AMC official administrative census records.</li>
+            <li><strong>Children (Age 0–5)</strong>: <span class="badge-derived">Derived</span> at 9.2% benchmark (Census 2011 urban child ratio).</li>
+            <li><strong>Youth (Age 6–17)</strong>: <span class="badge-derived">Derived</span> at 18.8% benchmark (Census 2011 urban youth ratio).</li>
+            <li><strong>Working Adults (Age 18–59)</strong>: <span class="badge-derived">Derived</span> from total population minus dependent cohorts.</li>
+            <li><strong>Outdoor vs Indoor Labor</strong>: <span class="badge-derived">Derived</span> using 45% workforce participation rate (PLFS urban India) minus outdoor informal manual labor.</li>
+          </ul>
+        </div>
+
+        <div class="explainer-section">
+          <h3>3. Clinical & Epidemiological Citations</h3>
+          <ul>
+            <li><strong>WHO/WMO 2015</strong>: <em>Heatwaves and Health: Guidance on Warning-System Development</em> (WMO-No. 1142).</li>
+            <li><strong>WHO 2021</strong>: <em>Public health advice on heat: guidance for clinical and public health practitioners</em>.</li>
+            <li><strong>Azhar et al. 2014</strong>: <em>Heat-Related Mortality in India: Excess All-Cause Mortality Associated with the 2010 Ahmedabad Heat Wave</em>. PLOS ONE, 9(3): e91831.</li>
+            <li><strong>NRDC & AMC 2018</strong>: <em>Ahmedabad Heat Action Plan (HAP): Guide to Extreme Heat Planning</em>.</li>
+            <li><strong>NDMA 2019/2024</strong>: <em>National Guidelines for Preparation of Action Plan - Prevention and Management of Heat Wave</em>.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-close-sources-modal-footer" class="btn-primary">Close Sources</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Unsubscribe / Manage Subscription Modal (Day 18) -->
+  <div id="manage-sub-modal" class="modal-backdrop" style="display: none;">
+    <div class="modal-dialog manage-sub-dialog">
+      <div class="modal-header">
+        <h2>🔕 Manage Free Alert Subscription</h2>
+        <button id="btn-close-manage-sub" class="modal-close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-lead">
+          Enter your registered mobile number below to immediately unsubscribe from automated heatwave early warnings. No account required.
+        </p>
+        <form id="unsubscribe-form" class="manage-sub-form">
+          <div class="sub-input-group">
+            <label for="unsub-phone-input">Mobile Number</label>
+            <div class="phone-input-wrapper">
+              <span class="country-prefix">+91</span>
+              <input type="tel" id="unsub-phone-input" class="sub-input" placeholder="98765 43210" required />
+            </div>
+          </div>
+          <div id="unsub-feedback-banner" class="sub-feedback-banner" style="display: none;"></div>
+          <div class="manage-modal-actions">
+            <button type="button" id="btn-cancel-unsub" class="btn-secondary">Cancel</button>
+            <button type="submit" id="btn-confirm-unsub" class="btn-danger-action">Unsubscribe Me</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Heat Copilot Floating Chat Widget (Day 12) -->
+  <button id="btn-copilot-toggle" class="copilot-toggle-btn" title="Open Heat Copilot Assistant" aria-label="Open Heat Copilot">
+    <span class="copilot-toggle-icon">💬</span>
+    <span class="copilot-toggle-badge">AI</span>
+  </button>
+
+  <div id="copilot-chat-window" class="copilot-chat-window" style="display: none;">
+    <div class="copilot-header">
+      <div class="copilot-header-info">
+        <div class="copilot-avatar">🔥</div>
+        <div>
+          <h3>Heat Copilot</h3>
+          <span class="copilot-subtitle">Personal Thermal Risk & Science Assistant</span>
+        </div>
+      </div>
+      <button id="btn-copilot-close" class="copilot-close-btn" title="Minimize Chat">&times;</button>
+    </div>
+
+    <div id="copilot-body" class="copilot-body">
+      <div id="copilot-messages" class="copilot-messages">
+        <div class="copilot-message copilot-message-bot">
+          <div class="copilot-bubble">
+            Hello! I am <strong>Heat Copilot</strong>, your conversational thermal risk assistant.
+            <br><br>
+            Ask me anything about your personal heat exposure risk (e.g. <em>"Is it safe to walk outside at 2 PM?"</em>),
+            thermal stress science (<em>"What does WBGT mean?"</em>), or how to use this dashboard!
+          </div>
+        </div>
+      </div>
+
+      <!-- Starter question chips -->
+      <div id="copilot-chips" class="copilot-chips">
+        <button class="copilot-chip" data-query="Is it safe to walk outside at 2 PM?">🚶 Safe to walk at 2 PM?</button>
+        <button class="copilot-chip" data-query="What does WBGT mean and why is it better than temperature?">🌡️ What does WBGT mean?</button>
+        <button class="copilot-chip" data-query="How accurate is this 5-day heatwave forecast?">🎯 How accurate is the forecast?</button>
+        <button class="copilot-chip" data-query="How do I view the 5-day forecast for my ward?">🗺️ How do I view my ward forecast?</button>
+      </div>
+
+      <div id="copilot-typing" class="copilot-typing" style="display: none;">
+        <span></span><span></span><span></span>
+      </div>
+    </div>
+
+    <form id="copilot-form" class="copilot-footer">
+      <input type="text" id="copilot-input" class="copilot-input" placeholder="Ask about heat safety or dashboard..." autocomplete="off" />
+      <button type="submit" id="copilot-send-btn" class="copilot-send-btn" title="Send message">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </form>
+  </div>
+
+  <!-- Dashboard Footer -->
+  <footer class="app-footer">
+    <div class="footer-left">
+      <span>SIH26083: Extreme Heatwave Early Warning & Human Thermal Stress Index</span>
+      <span class="divider">|</span>
+      <span>Problem Statement: SIH26083</span>
+    </div>
+    <div class="footer-right">
+      <span>Pilot: Ahmedabad Municipal Corporation (48 Wards)</span>
+      <span class="divider">|</span>
+      <span>Team ClimateResilience</span>
+    </div>
+  </footer>
+
+  <!-- Main ES Module Script -->
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
